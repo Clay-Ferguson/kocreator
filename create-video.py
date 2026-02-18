@@ -368,12 +368,20 @@ def main() -> None:
     total_duration: float = 0.0
 
     with concat_list.open("w", encoding="utf-8") as cl:
-        for f in media_files:
+        for i, f in enumerate(media_files):
             segment_file = segment_dir / f"segment-{segment_index:04d}.mp4"
             basename = f.name
 
             if f.suffix == ".png":
                 current_image = f
+                # If the very next file is audio, skip the silent segment so
+                # the audio starts immediately over this image (no 2-second
+                # silent hold before the narration begins).
+                next_file = media_files[i + 1] if i + 1 < len(media_files) else None
+                if next_file is not None and next_file.suffix in {".mp3", ".wav"}:
+                    print(f"  [{basename}] image (held for next audio, no silent segment)")
+                    continue  # don't build a segment; audio pass will pick up current_image
+
                 print(f"  [{basename}] image, {FRAME_DURATION}s ... ", end="", flush=True)
                 build_silent_segment(f, segment_file)
                 print(f"{GREEN}✓{NC}")

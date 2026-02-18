@@ -37,6 +37,35 @@ Files are processed in filename order. The first file must always be a `.png` sc
 
 Generated TTS audio is cached in a `generated-wav/` subfolder next to the source files and reused on subsequent runs unless the `.txt` source has changed.
 
+## Splashscreen / Intro
+
+You can prepend a shared intro (e.g. a branded splash screen) to every MP4 you produce without copying files into each demo folder. Place the intro assets in a folder named `intro/` **alongside** your demo folders:
+
+```
+screenshots/
+  intro/                     ← shared intro assets (sibling of your demo folders)
+    000-splash.png
+    001-splash-narration.txt
+  my-demo/
+    001-welcome.png
+    002-narration.txt
+    ...
+```
+
+When `create-video.py` runs, it automatically detects the `intro/` sibling folder and prepends its files — sorted by filename — to the beginning of the MP4. The intro files are kept entirely separate from the main demo files during sorting, so there is no risk of interleaving: all intro files come first (in their own order), followed by all demo files (in their own order).
+
+A few details:
+
+- **MP4 only** — intro files are included in the MP4 but are **not** added to the animated GIF.
+- **Same file types** — the intro folder supports the same `.png`, `.txt`, `.mp3`, and `.wav` files as a normal demo folder.
+- **TTS caching** — narration `.txt` files in `intro/` are converted to speech and cached in `intro/generated-wav/`, independent of the main demo's cache.
+- **First file rule** — the first file across intro + demo must still be a `.png` (which it will be naturally if your intro starts with a splash image).
+- **Skip the intro** — pass `--no-intro` to omit the intro folder for a single run:
+
+```bash
+python create-video.py <base-folder> <subfolder-name> --no-intro
+```
+
 ## Setup
 
 Run the one-time setup script to create a Python virtual environment, install dependencies, and download the Kokoro TTS model:

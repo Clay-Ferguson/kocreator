@@ -237,6 +237,12 @@ def main() -> None:
     )
     parser.add_argument("base_folder", help="Base project folder")
     parser.add_argument("subfolder_name", help="Subfolder name under screenshots/")
+    parser.add_argument(
+        "--no-intro",
+        action="store_true",
+        default=False,
+        help="Skip the intro folder files even if an intro/ sibling folder exists",
+    )
     args = parser.parse_args()
 
     base_folder = args.base_folder
@@ -252,6 +258,7 @@ def main() -> None:
     # --- Path setup ---------------------------------------------------------
     base_path = Path(base_folder)
     screenshot_dir = base_path / "screenshots" / subfolder_name
+    intro_dir = screenshot_dir.parent / "intro"
     output_dir = base_path / "test-videos"
     mp4_file = output_dir / f"{subfolder_name}.mp4"
     gif_file = output_dir / f"{subfolder_name}.gif"
@@ -259,6 +266,7 @@ def main() -> None:
     segment_dir = output_dir / f"{subfolder_name}-segments"
     concat_list = segment_dir / "concat-list.txt"
     generated_wav_dir = screenshot_dir / "generated-wav"
+    intro_generated_wav_dir = intro_dir / "generated-wav"
 
     print(f"{YELLOW}=== Create Video from Screenshots ==={NC}")
     print()
@@ -281,7 +289,7 @@ def main() -> None:
 
     # --- Collect and sort media files ---------------------------------------
     valid_extensions = {".png", ".mp3", ".wav", ".txt"}
-    media_files: list[Path] = sorted(
+    main_files: list[Path] = sorted(
         f
         for f in screenshot_dir.iterdir()
         if f.is_file()
@@ -289,9 +297,30 @@ def main() -> None:
         and "generated-wav" not in f.parts
     )
 
-    if not media_files:
+    if not main_files:
         print(f"{RED}✗ No .png, .mp3, .wav, or .txt files found in {screenshot_dir}/{NC}")
         sys.exit(1)
+
+    # --- Optionally prepend intro folder files (MP4 only) -------------------
+    intro_files: list[Path] = []
+    use_intro = not args.no_intro and intro_dir.is_dir()
+    if use_intro:
+        intro_files = sorted(
+            f
+            for f in intro_dir.iterdir()
+            if f.is_file()
+            and f.suffix.lower() in valid_extensions
+            and "generated-wav" not in f.parts
+        )
+        if intro_files:
+            print(f"Intro folder found: {intro_dir}/")
+            print(f"  Prepending {len(intro_files)} intro file(s) to MP4 (skipped for GIF)")
+            print()
+        else:
+            use_intro = False  # folder exists but is empty
+
+    # For MP4 we combine intro + main files
+    media_files: list[Path] = intro_files + main_files
 
     # --- Count by type ------------------------------------------------------
     image_count = sum(1 for f in media_files if f.suffix == ".png")
@@ -315,13 +344,19 @@ def main() -> None:
             f"Converting {tts_count} narration text file(s) to audio "
             f"via Kokoro TTS (voice: {KOKORO_VOICE})..."
         )
-        generated_wav_dir.mkdir(parents=True, exist_ok=True)
 
         converted_files: list[Path] = []
         for f in media_files:
             if f.suffix == ".txt":
+                # Use the appropriate generated-wav/ cache dir for the source file
+                if use_intro and f.parent == intro_dir:
+                    wav_cache_dir = intro_generated_wav_dir
+                else:
+                    wav_cache_dir = generated_wav_dir
+                wav_cache_dir.mkdir(parents=True, exist_ok=True)
+
                 txt_basename = f.stem
-                wav_path = generated_wav_dir / f"{txt_basename}.wav"
+                wav_path = wav_cache_dir / f"{txt_basename}.wav"
 
                 if (
                     wav_path.exists()
@@ -354,7 +389,15 @@ def main() -> None:
     gif_file.unlink(missing_ok=True)
 
     # --- Report what we found -----------------------------------------------
-    print(f"Found {image_count} screenshot(s) and {audio_count} audio clip(s)")
+    main_image_count = sum(1 for f in main_files if f.suffix == ".png")
+    intro_image_count = sum(1 for f in intro_files if f.suffix == ".png")
+    if use_intro and intro_files:
+        print(
+            f"Found {image_count} screenshot(s) ({intro_image_count} intro + "
+            f"{main_image_count} main) and {audio_count} audio clip(s)"
+        )
+    else:
+        print(f"Found {image_count} screenshot(s) and {audio_count} audio clip(s)")
     if tts_count > 0:
         print(f"  ({tts_count} narration text file(s) converted via Kokoro TTS)")
     print(f"Image frame duration: {FRAME_DURATION}s")
@@ -495,6 +538,8 @@ def main() -> None:
                 f"(cached in generated-wav/)"
             )
     print(f"  Subfolder: {subfolder_name}")
+    if use_intro and intro_files:
+        print(f"  Intro:     {len(intro_files)} file(s) prepended from {intro_dir}/")
     print()
     print(f"To view MP4: mpv {mp4_file}")
     print(f"To view GIF: mpv {gif_file}")

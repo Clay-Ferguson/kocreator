@@ -1,1 +1,6 @@
 .venv/
+attic/
+__pycache__/
+*.wav
+*.gif
+*.mp4

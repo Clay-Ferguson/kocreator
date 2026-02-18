@@ -1,0 +1,1 @@
+We'll start by creating a new file for our architecture diagram.

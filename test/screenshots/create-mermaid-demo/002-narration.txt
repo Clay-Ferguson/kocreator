@@ -1,0 +1,1 @@
+Welcome back to MkBrowser. In this demo, we'll explore another powerful feature: automatic Mermaid diagram rendering. Mermaid lets you create professional diagrams using simple text-based syntax. Let's create a software architecture diagram to see this in action.

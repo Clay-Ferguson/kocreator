@@ -1,0 +1,1 @@
+We've named it "my-architecture-diagram". Now let's create the file and add our diagram content.

@@ -1,0 +1,1 @@
+Perfect! Our file is created and the editor is ready. Now let's add a Mermaid diagram. We'll create a diagram showing a modern web application architecture with multiple interconnected components.

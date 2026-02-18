@@ -1,0 +1,1 @@
+The Create File dialog opens. Let's give our file a descriptive name that reflects its content.

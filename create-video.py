@@ -42,6 +42,11 @@ FRAME_DURATION = 2  # seconds per screenshot (images without audio)
 KOKORO_VOICE = "bm_daniel"
 SAMPLE_RATE = 24000  # Kokoro TTS output sample rate
 
+# When True: use all available CPU cores (fastest, but loud fans).
+# When False: cap threads at MAX_THREADS for a quieter, cooler run.
+HIGH_PERFORMANCE = False
+MAX_THREADS = 4     # max CPU threads used when HIGH_PERFORMANCE is False
+
 # ANSI colours
 GREEN = "\033[0;32m"
 YELLOW = "\033[1;33m"
@@ -66,10 +71,17 @@ def human_readable_size(path: Path) -> str:
 
 
 def run_ffmpeg(args: list[str], *, capture_filter: str | None = None) -> None:
-    """Run an ffmpeg command, optionally filtering stdout+stderr."""
+    """Run an ffmpeg command, optionally filtering stdout+stderr.
+
+    When HIGH_PERFORMANCE is False the global ``-threads`` flag is prepended
+    so every encode is capped at MAX_THREADS, keeping CPU load (and fan noise)
+    low.  When HIGH_PERFORMANCE is True ffmpeg uses all available cores.
+    """
+    # -threads N must come before any input/output flags to act as a global cap.
+    thread_args = [] if HIGH_PERFORMANCE else ["-threads", str(MAX_THREADS)]
     if capture_filter is not None:
         result = subprocess.run(
-            ["ffmpeg"] + args,
+            ["ffmpeg"] + thread_args + args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -79,7 +91,7 @@ def run_ffmpeg(args: list[str], *, capture_filter: str | None = None) -> None:
                 print(line)
     else:
         subprocess.run(
-            ["ffmpeg"] + args,
+            ["ffmpeg"] + thread_args + args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True,
@@ -145,6 +157,22 @@ def _ensure_kokoro_pipeline() -> None:
 
     # Force fully offline mode — never contact HuggingFace Hub.
     os.environ["HF_HUB_OFFLINE"] = "1"
+
+    if not HIGH_PERFORMANCE:
+        # Limit CPU parallelism for PyTorch / OpenMP / MKL so the TTS inference
+        # stays within MAX_THREADS and doesn't spin up every core.
+        # These env vars must be set before the native extensions are loaded,
+        # which is why they live here rather than at module level.
+        thread_str = str(MAX_THREADS)
+        os.environ.setdefault("OMP_NUM_THREADS", thread_str)
+        os.environ.setdefault("MKL_NUM_THREADS", thread_str)
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", thread_str)
+        try:
+            import torch  # type: ignore[import-untyped]
+            torch.set_num_threads(MAX_THREADS)
+            torch.set_num_interop_threads(MAX_THREADS)
+        except Exception:
+            pass  # torch not available; Kokoro will still respect the env vars above
 
     try:
         from kokoro import KPipeline  # type: ignore[import-untyped]
@@ -231,6 +259,8 @@ def build_audio_segment(image: Path, audio: Path, segment: Path) -> None:
 
 
 def main() -> None:
+    global MAX_THREADS  # noqa: PLW0603
+
     # --- Argument parsing ---------------------------------------------------
     parser = argparse.ArgumentParser(
         description="Create a demo video from screenshots and optional audio narration.",
@@ -243,7 +273,26 @@ def main() -> None:
         default=False,
         help="Skip the intro folder files even if an intro/ sibling folder exists",
     )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=MAX_THREADS,
+        metavar="N",
+        help=f"Max CPU threads for ffmpeg and Kokoro TTS (default: {MAX_THREADS})",
+    )
     args = parser.parse_args()
+
+    if not HIGH_PERFORMANCE:
+        # Apply the thread limit globally so run_ffmpeg and _ensure_kokoro_pipeline
+        # both pick up the (potentially overridden) value.
+        MAX_THREADS = args.threads
+
+        # Lower process scheduling priority so the OS yields to other tasks first,
+        # further reducing the chance of sustained full-load fan spin-up.
+        try:
+            os.nice(10)
+        except (AttributeError, PermissionError):
+            pass  # os.nice is not available on all platforms
 
     base_folder = args.base_folder
     subfolder_name = args.subfolder_name

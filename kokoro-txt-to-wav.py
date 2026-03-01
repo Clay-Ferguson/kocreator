@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-kokoro-generate.py — CLI wrapper for the official Kokoro TTS (hexgrad).
+kokoro-txt-to-wav.py — CLI wrapper for the official Kokoro TTS (hexgrad).
 
 Reads a text file and generates a WAV audio file using the official kokoro
 Python library with misaki G2P, which supports inline phonetic overrides
 using the [word](/phonemes/) syntax.
 
 Usage:
-    python kokoro-generate.py input.txt output.wav --voice bm_daniel
-    python kokoro-generate.py input.txt output.wav --voice af_heart --speed 1.2
+    python kokoro-txt-to-wav.py input.txt output.wav --voice bm_daniel
+    python kokoro-txt-to-wav.py input.txt output.wav --voice af_heart --speed 1.2
 
 Source: https://github.com/hexgrad/kokoro
 """

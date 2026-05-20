@@ -7,7 +7,7 @@ Python library with misaki G2P, which supports inline phonetic overrides
 using the [word](/phonemes/) syntax.
 
 Usage:
-    python kokoro-txt-to-wav.py input.txt output.wav --voice bm_daniel
+    python kokoro-txt-to-wav.py input.txt output.wav --voice am_liam
     python kokoro-txt-to-wav.py input.txt output.wav --voice af_heart --speed 1.2
 
 Source: https://github.com/hexgrad/kokoro
@@ -56,8 +56,8 @@ def main():
         description='Generate speech from text using official Kokoro TTS (hexgrad)')
     parser.add_argument('input', help='Input text file path')
     parser.add_argument('output', help='Output WAV file path')
-    parser.add_argument('--voice', default='bm_daniel',
-                        help='Voice name (default: bm_daniel)')
+    parser.add_argument('--voice', default='am_liam',
+                        help='Voice name (default: am_liam)')
     parser.add_argument('--speed', type=float, default=1.0,
                         help='Speech speed (default: 1.0)')
     parser.add_argument('--lang', default=None,

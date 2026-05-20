@@ -39,7 +39,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 FRAME_DURATION = 2  # seconds per screenshot (images without audio)
-KOKORO_VOICE = "bm_daniel"
+KOKORO_VOICE = "am_liam" # NOTE: Originally we had 'bm_daniel' here.
 SAMPLE_RATE = 24000  # Kokoro TTS output sample rate
 
 # When True: use all available CPU cores (fastest, but loud fans).

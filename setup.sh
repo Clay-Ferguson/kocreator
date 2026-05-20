@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup.sh — Install Official Kokoro TTS (hexgrad) on Ubuntu
-# After running: source .venv/bin/activate && python kokoro-generate.py input.txt output.wav --voice bm_daniel
+# After running: source .venv/bin/activate && python kokoro-generate.py input.txt output.wav --voice am_liam
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,13 +55,13 @@ pip install "kokoro>=0.9.4" soundfile "misaki[en]" --quiet
 info "kokoro installed: $(pip show kokoro | grep Version)"
 
 # ── Step 4: Smoke test ─────────────────────────────────────────────
-info "Running smoke test with bm_daniel voice..."
+info "Running smoke test with am_liam voice..."
 python -c "
 from kokoro import KPipeline
 import soundfile as sf
 
 pipeline = KPipeline(lang_code='b')
-generator = pipeline('[Kokoro](/kˈOkəɹO/) setup is complete.', voice='bm_daniel')
+generator = pipeline('[Kokoro](/kˈOkəɹO/) setup is complete.', voice='am_liam')
 for i, (gs, ps, audio) in enumerate(generator):
     sf.write('test_output.wav', audio, 24000)
     break
@@ -85,5 +85,5 @@ echo ""
 echo "  Usage:"
 echo "    cd $SCRIPT_DIR"
 echo "    source .venv/bin/activate"
-echo "    python kokoro-generate.py input.txt output.wav --voice bm_daniel"
+echo "    python kokoro-generate.py input.txt output.wav --voice am_liam"
 echo ""

@@ -60,7 +60,7 @@ python -c "
 from kokoro import KPipeline
 import soundfile as sf
 
-pipeline = KPipeline(lang_code='b')
+pipeline = KPipeline(lang_code='a')
 generator = pipeline('[Kokoro](/kˈOkəɹO/) setup is complete.', voice='am_liam')
 for i, (gs, ps, audio) in enumerate(generator):
     sf.write('test_output.wav', audio, 24000)

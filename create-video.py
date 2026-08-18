@@ -123,7 +123,7 @@ def get_audio_duration(audio_path: Path) -> float | None:
 # Kokoro TTS (in-process)
 # ---------------------------------------------------------------------------
 
-# Voice prefix -> language code mapping (mirrors kokoro-generate.py)
+# Voice prefix -> language code mapping (mirrors kokoro-txt-to-wav.py)
 _LANG_CODE_MAP = {
     "a": "a",  # American English
     "b": "b",  # British English
@@ -183,7 +183,7 @@ def _ensure_kokoro_pipeline() -> None:
         )
         print(
             "Narration .txt files require the kokoro package.\n"
-            "Install with: pip install 'kokoro>=0.9.4' 'misaki[en]' soundfile",
+            "Install with: pip install -r requirements.txt",
             file=sys.stderr,
         )
         sys.exit(1)

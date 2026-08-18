@@ -1,0 +1,39 @@
+# KoCreator Python dependencies
+# ---------------------------------------------------------------------------
+# Install into the project venv (setup.sh does this for you):
+#
+#     source .venv/bin/activate
+#     pip install -r requirements.txt
+#
+# Python 3.10-3.12 only: kokoro and misaki both declare
+# requires-python ">=3.10,<3.13", so this file will not resolve on 3.13+.
+#
+# These are the project's *direct* dependencies, pinned to the versions it has
+# been verified against. Transitive packages (transformers, spacy, tokenizers,
+# and the nvidia-* / cuda-* CUDA runtime wheels) are deliberately left for pip
+# to resolve -- read the "Upgrading Dependencies" section of README.md before
+# touching those.
+# ---------------------------------------------------------------------------
+
+# Text-to-speech engine, plus the grapheme-to-phoneme frontend it uses.
+# The [en] extra pulls the English G2P stack (espeakng-loader, num2words, spacy).
+kokoro==0.9.4
+misaki[en]==0.9.4
+
+# WAV encoding for the generated narration audio.
+soundfile==0.14.0
+
+# Audio buffer concatenation. Also a kokoro dependency, but pinned here because
+# create-video.py and kokoro-txt-to-wav.py both import it directly.
+numpy==2.5.2
+
+# Inference backend. create-video.py imports torch directly to cap thread counts
+# when HIGH_PERFORMANCE is False. Installing torch also pulls the exact
+# nvidia-* / cuda-* wheels it requires -- never upgrade those on their own.
+torch==2.13.0
+
+# spaCy English pipeline used by misaki's G2P. It is not published to PyPI, so
+# it is referenced by its official release URL. Declaring it here matters:
+# without it, misaki calls spacy.cli.download() on first use, which silently
+# breaks the "no internet after setup" guarantee on a fresh machine.
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

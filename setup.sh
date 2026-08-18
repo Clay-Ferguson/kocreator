@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup.sh — Install Official Kokoro TTS (hexgrad) on Ubuntu
-# After running: source .venv/bin/activate && python kokoro-generate.py input.txt output.wav --voice am_liam
+# After running: source .venv/bin/activate && python kokoro-txt-to-wav.py input.txt output.wav --voice am_liam
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,11 +48,25 @@ fi
 source .venv/bin/activate
 info "Python: $(python --version) at $(which python)"
 
-# ── Step 3: Install official kokoro package ────────────────────────
-info "Installing official kokoro package (hexgrad) via pip..."
-pip install --upgrade pip --quiet
-pip install "kokoro>=0.9.4" soundfile "misaki[en]" --quiet
+# ── Step 3: Install Python dependencies ────────────────────────────
+if [ ! -f "requirements.txt" ]; then
+    error "requirements.txt not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+info "Installing Python dependencies from requirements.txt..."
+pip install --upgrade pip setuptools --quiet
+# requirements.txt pins exact versions, so re-running setup.sh against an
+# existing .venv converges it back onto the known-good set.
+pip install -r requirements.txt --quiet
 info "kokoro installed: $(pip show kokoro | grep Version)"
+info "misaki installed: $(pip show misaki | grep Version)"
+
+# Confirm the resolved dependency set is self-consistent (e.g. transformers and
+# tokenizers agreeing) before we bother running the model.
+if ! pip check; then
+    warn "pip reported dependency conflicts above — the smoke test may fail."
+fi
 
 # ── Step 4: Smoke test ─────────────────────────────────────────────
 info "Running smoke test with am_liam voice..."
@@ -85,5 +99,5 @@ echo ""
 echo "  Usage:"
 echo "    cd $SCRIPT_DIR"
 echo "    source .venv/bin/activate"
-echo "    python kokoro-generate.py input.txt output.wav --voice am_liam"
+echo "    python kokoro-txt-to-wav.py input.txt output.wav --voice am_liam"
 echo ""

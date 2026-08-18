@@ -83,6 +83,55 @@ This requires internet access to download the Kokoro model (~327 MB) and voice f
 
 **System requirements:** Ubuntu Linux, Python 3.10–3.12, ffmpeg.
 
+### Dependencies
+
+Python dependencies live in `requirements.txt`, which pins the project's **direct**
+dependencies to the versions it has been verified against, so a fresh `./setup.sh`
+reproduces a known-good environment. Transitive packages (`transformers`, `spacy`,
+`tokenizers`, and the `nvidia-*` / `cuda-*` CUDA runtime wheels) are left for pip to
+resolve, since `torch` and `kokoro` constrain them themselves.
+
+One entry is worth calling out: `en_core_web_sm`, the spaCy English pipeline that
+misaki's grapheme-to-phoneme stage needs. It is not published to PyPI, so it is
+referenced by its official release URL. Without that line, misaki calls
+`spacy.cli.download()` the first time it runs, which quietly breaks the "no internet
+after setup" guarantee on a fresh machine.
+
+### Upgrading Dependencies
+
+To move to newer releases:
+
+```bash
+source .venv/bin/activate
+pip install --upgrade kokoro "misaki[en]" soundfile numpy torch
+pip check              # confirm the resolved set is self-consistent
+./test-generate.sh     # confirm TTS and video output still work
+```
+
+Then update the pins in `requirements.txt` to match what `pip freeze` now reports for
+those packages.
+
+Two things keep this from being a plain "upgrade everything":
+
+- **Python must stay below 3.13.** Both `kokoro` and `misaki` declare
+  `requires-python = ">=3.10,<3.13"`, which is why `setup.sh` searches for 3.12/3.11/3.10
+  and refuses to build the venv on 3.13+.
+- **Leave the `nvidia-*` / `cuda-*` wheels to `torch`.** PyTorch pins them exactly
+  (e.g. `nvidia-cudnn-cu13==9.20.0.48`), so upgrading them on their own breaks the
+  install. If a `torch` upgrade crosses a CUDA major version, do **not** `pip uninstall`
+  the now-orphaned older-CUDA wheels: both generations write to some of the same paths
+  under `site-packages/nvidia/`, so removing the old package deletes shared-library files
+  the new one is actually using, and `import torch` then fails with
+  `ImportError: libcudnn.so.9: cannot open shared object file`. Repair it with
+  `pip install --force-reinstall --no-deps nvidia-cudnn-cu13 nvidia-nccl-cu13 ...`.
+
+A few transitive packages are also held back by upper bounds and cannot go to their
+newest releases: `thinc` (spaCy 3.8 requires `<8.4.0`), `tokenizers` (transformers
+requires `<=0.23.0`), and `mpmath` (sympy requires `<1.4`).
+
+Last verified (2026-08-18) on Python 3.12 with kokoro 0.9.4, misaki 0.9.4,
+soundfile 0.14.0, torch 2.13.0, transformers 5.15.0, spacy 3.8.15, and numpy 2.5.2.
+
 ## Usage
 
 ```bash
@@ -113,6 +162,7 @@ Output will appear in `test/test-videos/`.
 |------|---------|
 | `create-video.py` | Main application — builds MP4 and GIF videos from screenshots and narration |
 | `kokoro-txt-to-wav.py` | Standalone CLI utility — converts a single text file to a WAV using Kokoro TTS |
+| `requirements.txt` | Pinned direct Python dependencies — installed by `setup.sh` |
 | `setup.sh` | One-time setup — creates Python venv, installs kokoro + misaki + ffmpeg deps, runs smoke test |
 | `test-generate.sh` | Runs `create-video.py` against the built-in test data in `test/` |
 

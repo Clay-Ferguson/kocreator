@@ -7,8 +7,8 @@ Python library with misaki G2P, which supports inline phonetic overrides
 using the [word](/phonemes/) syntax.
 
 Usage:
-    python kokoro-txt-to-wav.py input.txt output.wav --voice am_liam
-    python kokoro-txt-to-wav.py input.txt output.wav --voice af_heart --speed 1.2
+    uv run kokoro-txt-to-wav.py input.txt output.wav --voice am_liam
+    uv run kokoro-txt-to-wav.py input.txt output.wav --voice af_heart --speed 1.2
 
 Source: https://github.com/hexgrad/kokoro
 """

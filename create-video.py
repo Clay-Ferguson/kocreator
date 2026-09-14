@@ -224,7 +224,7 @@ def _ensure_kokoro_pipeline() -> None:
         )
         print(
             "Narration .txt files require the kokoro package.\n"
-            "Install with: pip install -r requirements.txt",
+            "Run ./setup.sh (or `uv sync`), then launch with: uv run create-video.py ...",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup.sh — Install Official Kokoro TTS (hexgrad) on Ubuntu
-# After running: source .venv/bin/activate && python kokoro-txt-to-wav.py input.txt output.wav --voice am_liam
+# After running: uv run kokoro-txt-to-wav.py input.txt output.wav --voice am_liam
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,61 +16,31 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
 # ── Step 1: System dependencies ────────────────────────────────────
-info "Installing system dependencies (espeak-ng, python3-venv)..."
+info "Installing system dependencies (espeak-ng, ffmpeg)..."
 sudo apt-get update -qq
-sudo apt-get install -y espeak-ng python3 python3-venv python3-pip
+sudo apt-get install -y espeak-ng ffmpeg
 
-# ── Step 2: Python virtual environment ─────────────────────────────
-# kokoro requires Python >=3.10,<3.13 — do NOT use 3.13
-PYTHON_BIN=""
-for candidate in python3.12 python3.11 python3.10; do
-    if command -v "$candidate" &>/dev/null; then
-        PYTHON_BIN="$(command -v "$candidate")"
-        break
-    fi
-done
-
-if [ -z "$PYTHON_BIN" ]; then
-    error "No compatible Python (3.10-3.12) found. kokoro requires Python <3.13."
-    error "Install Python 3.12 with: sudo apt-get install python3.12 python3.12-venv"
+# ── Step 2: uv ─────────────────────────────────────────────────────
+# uv manages the Python interpreter and the project virtualenv. It reads
+# .python-version (3.12 — kokoro requires Python <3.13) and downloads that
+# interpreter into its shared store if the machine doesn't already have one.
+if ! command -v uv >/dev/null 2>&1; then
+    error "uv is required but was not found in PATH."
+    error "Install it from https://docs.astral.sh/uv/ or via: curl -LsSf https://astral.sh/uv/install.sh | sh"
     exit 1
 fi
-
-info "Using $PYTHON_BIN ($($PYTHON_BIN --version))"
-
-if [ -d ".venv" ]; then
-    info "Virtual environment .venv/ already exists, reusing it."
-else
-    info "Creating Python virtual environment at .venv/ ..."
-    "$PYTHON_BIN" -m venv .venv
-fi
-
-source .venv/bin/activate
-info "Python: $(python --version) at $(which python)"
 
 # ── Step 3: Install Python dependencies ────────────────────────────
-if [ ! -f "requirements.txt" ]; then
-    error "requirements.txt not found in $SCRIPT_DIR"
-    exit 1
-fi
-
-info "Installing Python dependencies from requirements.txt..."
-pip install --upgrade pip setuptools --quiet
-# requirements.txt pins exact versions, so re-running setup.sh against an
-# existing .venv converges it back onto the known-good set.
-pip install -r requirements.txt --quiet
-info "kokoro installed: $(pip show kokoro | grep Version)"
-info "misaki installed: $(pip show misaki | grep Version)"
-
-# Confirm the resolved dependency set is self-consistent (e.g. transformers and
-# tokenizers agreeing) before we bother running the model.
-if ! pip check; then
-    warn "pip reported dependency conflicts above — the smoke test may fail."
-fi
+# --locked installs exactly what uv.lock records (and fails if pyproject.toml
+# has drifted from it), so re-running setup.sh converges .venv back onto the
+# known-good set.
+info "Installing Python dependencies from uv.lock..."
+uv sync --locked
+info "Python: $(uv run python --version)"
 
 # ── Step 4: Smoke test ─────────────────────────────────────────────
 info "Running smoke test with am_liam voice..."
-python -c "
+uv run python -c "
 from kokoro import KPipeline
 import soundfile as sf
 
@@ -98,6 +68,6 @@ echo "  G2P: misaki — supports [word](/phonemes/) pronunciation overrides"
 echo ""
 echo "  Usage:"
 echo "    cd $SCRIPT_DIR"
-echo "    source .venv/bin/activate"
-echo "    python kokoro-txt-to-wav.py input.txt output.wav --voice am_liam"
+echo "    uv run create-video.py <base-folder> <subfolder-name>"
+echo "    uv run kokoro-txt-to-wav.py input.txt output.wav --voice am_liam"
 echo ""

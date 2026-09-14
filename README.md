@@ -2,7 +2,7 @@
 
 A video authoring tool that converts a directory of screenshots and narration (text files) into demo videos. Point it at a folder of numbered `.png` images and `.txt` narration scripts and it produces both an **MP4** (with AI-generated voice narration) and an **animated GIF**.
 
-Text-to-speech is powered by [Kokoro TTS](https://github.com/hexgrad/kokoro) (hexgrad, Apache 2.0), which runs entirely offline on your local CPU/GPU after initial setup.
+Text-to-speech is powered by [Kokoro TTS](https://github.com/hexgrad/kokoro) (hexgrad, Apache 2.0), which runs entirely offline on your local CPU after initial setup.
 
 ## Demo Output
 
@@ -67,29 +67,39 @@ A few details:
 - **Skip the intro** — pass `--no-intro` to omit the intro folder for a single run:
 
 ```bash
-python create-video.py <base-folder> <subfolder-name> --no-intro
+uv run create-video.py <base-folder> <subfolder-name> --no-intro
 ```
 
 ## Setup
 
-Run the one-time setup script to create a Python virtual environment, install dependencies, and download the Kokoro TTS model:
+KoCreator is a [uv](https://docs.astral.sh/uv/) project. Install uv first, then run the one-time setup script to install system packages and Python dependencies, and download the Kokoro TTS model:
 
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't already have uv
 chmod +x setup.sh
 ./setup.sh
 ```
 
 This requires internet access to download the Kokoro model (~327 MB) and voice files from HuggingFace. These are cached locally in `~/.cache/huggingface/` and only downloaded once.
 
-**System requirements:** Ubuntu Linux, Python 3.10–3.12, ffmpeg.
+**System requirements:** Ubuntu Linux and uv. `setup.sh` installs `espeak-ng` and `ffmpeg` via apt. You don't need a particular Python installed: `.python-version` pins 3.12, and uv downloads that interpreter into its shared store if your machine lacks it.
+
+The project virtualenv lives in `.venv/` (gitignored). uv creates and maintains it; you never need to activate it, because `uv run` uses it automatically.
 
 ### Dependencies
 
-Python dependencies live in `requirements.txt`, which pins the project's **direct**
-dependencies to the versions it has been verified against, so a fresh `./setup.sh`
-reproduces a known-good environment. Transitive packages (`transformers`, `spacy`,
-`tokenizers`, and the `nvidia-*` / `cuda-*` CUDA runtime wheels) are left for pip to
-resolve, since `torch` and `kokoro` constrain them themselves.
+Python dependencies are declared in `pyproject.toml`, which pins the project's **direct**
+dependencies to the versions it has been verified against. `uv.lock` records the exact
+version of every package, transitive ones included (`transformers`, `spacy`,
+`tokenizers`, ...), so a fresh `./setup.sh` (`uv sync --locked`) reproduces a known-good
+environment.
+
+`torch` is installed from PyTorch's **CPU-only** index rather than PyPI. The default PyPI
+build for Linux bundles ~3.4 GB of NVIDIA CUDA runtime wheels (`nvidia-*`, `cuda-*`,
+`triton`) whether or not the machine has an NVIDIA GPU, and Kokoro only ever chooses
+between CUDA and CPU; its 82M-parameter model runs comfortably on CPU. If you have an
+NVIDIA GPU and want to use it, delete the `torch` entry under `[tool.uv.sources]` in
+`pyproject.toml`, then run `uv lock && uv sync`.
 
 One entry is worth calling out: `en_core_web_sm`, the spaCy English pipeline that
 misaki's grapheme-to-phoneme stage needs. It is not published to PyPI, so it is
@@ -101,29 +111,23 @@ after setup" guarantee on a fresh machine.
 
 To move to newer releases:
 
+1. Raise the pins in `pyproject.toml` (for example `torch==2.14.0`).
+2. Re-resolve, install, and test:
+
 ```bash
-source .venv/bin/activate
-pip install --upgrade kokoro "misaki[en]" soundfile numpy torch
-pip check              # confirm the resolved set is self-consistent
+uv lock                # re-resolve against the new pins; other locked versions are kept where possible
+uv sync                # bring .venv in line with the new lock
 ./test-generate.sh     # confirm TTS and video output still work
 ```
 
-Then update the pins in `requirements.txt` to match what `pip freeze` now reports for
-those packages.
+3. Commit `pyproject.toml` and `uv.lock` together.
 
-Two things keep this from being a plain "upgrade everything":
+To refresh only the transitive packages without touching the pins, run `uv lock --upgrade`.
 
-- **Python must stay below 3.13.** Both `kokoro` and `misaki` declare
-  `requires-python = ">=3.10,<3.13"`, which is why `setup.sh` searches for 3.12/3.11/3.10
-  and refuses to build the venv on 3.13+.
-- **Leave the `nvidia-*` / `cuda-*` wheels to `torch`.** PyTorch pins them exactly
-  (e.g. `nvidia-cudnn-cu13==9.20.0.48`), so upgrading them on their own breaks the
-  install. If a `torch` upgrade crosses a CUDA major version, do **not** `pip uninstall`
-  the now-orphaned older-CUDA wheels: both generations write to some of the same paths
-  under `site-packages/nvidia/`, so removing the old package deletes shared-library files
-  the new one is actually using, and `import torch` then fails with
-  `ImportError: libcudnn.so.9: cannot open shared object file`. Repair it with
-  `pip install --force-reinstall --no-deps nvidia-cudnn-cu13 nvidia-nccl-cu13 ...`.
+**Python is pinned to 3.12.** Both `kokoro` and `misaki` declare
+`requires-python = ">=3.10,<3.13"`, and `numpy` 2.5 requires 3.12 or newer, so
+`pyproject.toml` declares `requires-python = ">=3.12,<3.13"` and `.python-version` pins
+3.12. Moving to 3.13+ has to wait for new kokoro/misaki releases.
 
 A few transitive packages are also held back by upper bounds and cannot go to their
 newest releases: `thinc` (spaCy 3.8 requires `<8.4.0`), `tokenizers` (transformers
@@ -135,8 +139,7 @@ soundfile 0.14.0, torch 2.13.0, transformers 5.15.0, spacy 3.8.15, and numpy 2.5
 ## Usage
 
 ```bash
-source .venv/bin/activate
-python create-video.py <base-folder> <subfolder-name>
+uv run create-video.py <base-folder> <subfolder-name>
 ```
 
 The script looks for media files in `<base-folder>/screenshots/<subfolder-name>/` and writes output to `<base-folder>/test-videos/`:
@@ -200,8 +203,10 @@ Output will appear in `test/test-videos/`.
 |------|---------|
 | `create-video.py` | Main application — builds MP4 and GIF videos from screenshots and narration |
 | `kokoro-txt-to-wav.py` | Standalone CLI utility — converts a single text file to a WAV using Kokoro TTS |
-| `requirements.txt` | Pinned direct Python dependencies — installed by `setup.sh` |
-| `setup.sh` | One-time setup — creates Python venv, installs kokoro + misaki + ffmpeg deps, runs smoke test |
+| `pyproject.toml` | Pinned direct Python dependencies and the CPU-only torch source |
+| `uv.lock` | Exact resolved versions of every Python package — installed by `setup.sh` |
+| `.python-version` | Python version uv uses for the project (3.12) |
+| `setup.sh` | One-time setup — installs espeak-ng + ffmpeg, syncs Python deps with uv, runs smoke test |
 | `test-generate.sh` | Runs `create-video.py` against the built-in test data in `test/` |
 
 ## Phonetic Overrides

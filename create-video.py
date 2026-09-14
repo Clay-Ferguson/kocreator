@@ -16,6 +16,13 @@ generate WAV audio. Generated files are cached in a generated-wav/
 subfolder inside the screenshot directory and reused on subsequent runs
 if the .txt source hasn't changed.
 
+The MP4 is encoded for maximum browser compatibility: H.264 High profile
+level 4.0 (8-bit yuv420p), one fixed resolution for the whole file, square
+pixels, constant frame rate, BT.709 colour tags, AAC-LC audio, and a faststart
+container. Screenshots of differing sizes are letterboxed onto a single canvas
+rather than switching resolution mid-stream — see the encoding constants below
+and the README for why that matters.
+
 Usage: python create-video.py <base-folder> <subfolder-name>
 
 Example folder structure:
@@ -41,6 +48,40 @@ from pathlib import Path
 FRAME_DURATION = 2  # seconds per screenshot (images without audio)
 KOKORO_VOICE = "am_liam" # NOTE: Originally we had 'bm_daniel' here.
 SAMPLE_RATE = 24000  # Kokoro TTS output sample rate
+
+# ---------------------------------------------------------------------------
+# Web-compatibility encoding profile
+# ---------------------------------------------------------------------------
+# Every segment MUST be encoded with byte-identical stream parameters, because
+# the final MP4 is produced by concatenating segments with "-c copy".  An MP4
+# stores the video resolution once, in the container header (avcC/tkhd), taken
+# from the *first* segment.  If a later segment has a different resolution the
+# file still plays under permissive software decoders (ffmpeg, mpv, Chrome on
+# Linux) but hardware decoders — Safari, Chrome/Edge on Windows, Firefox on
+# most platforms — stop producing frames at the switch.  The classic symptom is
+# "audio plays, video is blank".  Screenshots routinely differ in size (an
+# intro splash vs. app captures), so all frames are letterboxed onto one fixed
+# canvas below.
+TARGET_FPS = 30          # constant frame rate for every segment
+MAX_WIDTH = 1920         # canvas is capped here so H.264 level 4.0 always holds
+MAX_HEIGHT = 1080
+H264_PROFILE = "high"    # High 8-bit 4:2:0 — universally decodable in browsers
+H264_LEVEL = "4.0"       # 4.0 covers up to 1920x1080@30 on every shipping decoder
+PAD_COLOR = "black"      # letterbox/pillarbox fill
+# AAC-LC at 44.1 kHz is the universal web audio baseline.  Mono is just as
+# universally decodable as stereo, and the narration is mono to begin with
+# (Kokoro TTS emits a single 24 kHz channel), so encoding stereo only spent
+# bits on a duplicate channel.  64 kbps mono is ample for speech.
+AUDIO_RATE = 44100
+AUDIO_CHANNELS = 1
+AUDIO_BITRATE = "64k"
+MOV_TIMESCALE = 90000    # standard MP4 video timescale
+# Every segment already opens with a keyframe, so each screenshot change is
+# seekable regardless.  Extra keyframes *within* a held still image are pure
+# waste — at CRF 18 each one costs a full intra-coded screenshot — so the GOP
+# is long.  Browsers still seek accurately: they decode forward from the
+# preceding keyframe, which is instant across near-empty P-frames.
+GOP_SECONDS = 10
 
 # When True: use all available CPU cores (fastest, but loud fans).
 # When False: cap threads at MAX_THREADS for a quieter, cooler run.
@@ -219,38 +260,187 @@ def run_kokoro_tts(input_txt: Path, output_wav: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Canvas sizing and shared encoder settings
+# ---------------------------------------------------------------------------
+
+
+def get_image_size(image_path: Path) -> tuple[int, int] | None:
+    """Return (width, height) of an image via ffprobe, or None on failure."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+            str(image_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    parts = result.stdout.strip().split("x")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def compute_canvas_size(images: list[Path]) -> tuple[int, int]:
+    """Pick the single output resolution every segment will be rendered onto.
+
+    The most frequently occurring screenshot size wins (ties broken by the
+    larger area), so the bulk of the footage stays pixel-exact and only the
+    odd-sized frames — intro splashes, dialogs captured at another size — get
+    scaled down and letterboxed.  The result is clamped to MAX_WIDTH/MAX_HEIGHT
+    and forced to even dimensions, which H.264 4:2:0 chroma subsampling
+    requires.
+    """
+    counts: dict[tuple[int, int], int] = {}
+    for image in images:
+        size = get_image_size(image)
+        if size is not None:
+            counts[size] = counts.get(size, 0) + 1
+
+    if not counts:
+        print(f"{RED}✗ Could not determine screenshot dimensions{NC}", file=sys.stderr)
+        sys.exit(1)
+
+    width, height = max(counts, key=lambda s: (counts[s], s[0] * s[1]))
+
+    # Only ever shrink — upscaling screenshots blurs text for no benefit.
+    ratio = min(MAX_WIDTH / width, MAX_HEIGHT / height, 1.0)
+    width = int(width * ratio)
+    height = int(height * ratio)
+
+    return max(2, width - width % 2), max(2, height - height % 2)
+
+
+def video_filter(canvas: tuple[int, int]) -> str:
+    """Build the filter chain that normalises any image onto the canvas.
+
+    ``scale`` performs the RGB→YUV conversion itself (the following ``format``
+    filter constrains its output format), so ``out_color_matrix`` genuinely
+    takes effect and the pixel data matches the BT.709 tags set on the output.
+    Without that, swscale silently uses BT.601 coefficients and browsers render
+    slightly shifted colours.  ``setsar=1`` guarantees square pixels so no
+    player second-guesses the aspect ratio.
+    """
+    width, height = canvas
+    return (
+        f"scale={width}:{height}"
+        ":force_original_aspect_ratio=decrease"
+        ":flags=lanczos"
+        ":out_color_matrix=bt709"
+        ":out_range=tv,"
+        "format=yuv420p,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color={PAD_COLOR},"
+        "setsar=1"
+    )
+
+
+def video_encode_args(canvas: tuple[int, int]) -> list[str]:
+    """ffmpeg video arguments shared by every segment.
+
+    These must be identical across segments so the concatenated MP4 has one
+    unchanging SPS/PPS — see the note on the encoding constants above.
+    """
+    return [
+        "-vf", video_filter(canvas),
+        "-r", str(TARGET_FPS),
+        "-c:v", "libx264",
+        "-preset", "slow",
+        "-crf", "18",
+        "-profile:v", H264_PROFILE,
+        "-level", H264_LEVEL,
+        "-pix_fmt", "yuv420p",
+        "-g", str(TARGET_FPS * GOP_SECONDS),
+        # Tag the colour space explicitly; untagged streams are guessed at, and
+        # different browsers guess differently.
+        "-colorspace", "bt709",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-color_range", "tv",
+    ]
+
+
+def audio_encode_args() -> list[str]:
+    """ffmpeg audio arguments shared by every segment (AAC-LC, the web baseline)."""
+    return [
+        "-c:a", "aac",
+        "-profile:a", "aac_low",
+        "-b:a", AUDIO_BITRATE,
+        "-ar", str(AUDIO_RATE),
+        "-ac", str(AUDIO_CHANNELS),
+    ]
+
+
+def segment_stream_signature(segment: Path) -> str | None:
+    """Return a fingerprint of a segment's stream parameters, or None on failure.
+
+    Used to assert that every segment really is concat-compatible before the
+    "-c copy" join, so a mismatched segment fails loudly here instead of
+    silently producing a file that only plays in permissive players.
+    """
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries",
+            "stream=codec_name,width,height,pix_fmt,profile,level,"
+            "sample_rate,channels,sample_fmt",
+            "-of", "csv=p=0",
+            str(segment),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    signature = result.stdout.strip()
+    return signature or None
+
+
+# ---------------------------------------------------------------------------
 # Segment builders (ffmpeg)
 # ---------------------------------------------------------------------------
 
 
-def build_silent_segment(image: Path, segment: Path) -> None:
+def build_silent_segment(image: Path, segment: Path, canvas: tuple[int, int]) -> None:
     """Create a video segment from a still image with silent audio."""
-    run_ffmpeg([
-        "-y",
-        "-loop", "1", "-i", str(image),
-        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-        "-t", str(FRAME_DURATION),
-        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
-        str(segment),
-    ])
+    run_ffmpeg(
+        [
+            "-y",
+            "-loop", "1", "-framerate", str(TARGET_FPS), "-i", str(image),
+            "-f", "lavfi", "-i",
+            f"anullsrc=r={AUDIO_RATE}:cl={'mono' if AUDIO_CHANNELS == 1 else 'stereo'}",
+            "-t", str(FRAME_DURATION),
+        ]
+        + video_encode_args(canvas)
+        + audio_encode_args()
+        + [
+            "-video_track_timescale", str(MOV_TIMESCALE),
+            "-shortest",
+            str(segment),
+        ]
+    )
 
 
-def build_audio_segment(image: Path, audio: Path, segment: Path) -> None:
+def build_audio_segment(
+    image: Path, audio: Path, segment: Path, canvas: tuple[int, int]
+) -> None:
     """Create a video segment holding *image* on screen for the duration of *audio*."""
-    run_ffmpeg([
-        "-y",
-        "-loop", "1", "-i", str(image),
-        "-i", str(audio),
-        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
-        "-ar", "44100", "-ac", "2",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
-        str(segment),
-    ])
+    run_ffmpeg(
+        [
+            "-y",
+            "-loop", "1", "-framerate", str(TARGET_FPS), "-i", str(image),
+            "-i", str(audio),
+        ]
+        + video_encode_args(canvas)
+        + audio_encode_args()
+        + [
+            "-video_track_timescale", str(MOV_TIMESCALE),
+            "-shortest",
+            str(segment),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +644,18 @@ def main() -> None:
         print(f"Total video length: {image_count * FRAME_DURATION}s")
     print()
 
+    # --- Decide the one output resolution used by every segment -------------
+    all_images = [f for f in media_files if f.suffix == ".png"]
+    canvas = compute_canvas_size(all_images)
+    distinct_sizes = {get_image_size(f) for f in all_images} - {None}
+    print(f"Output canvas: {canvas[0]}x{canvas[1]} "
+          f"(H.264 {H264_PROFILE} profile, level {H264_LEVEL}, {TARGET_FPS}fps)")
+    if len(distinct_sizes) > 1:
+        sizes = ", ".join(f"{w}x{h}" for w, h in sorted(distinct_sizes))
+        print(f"  {YELLOW}Screenshots vary in size ({sizes}) — off-size frames "
+              f"will be scaled down and letterboxed onto the canvas.{NC}")
+    print()
+
     # --- Build video segments -----------------------------------------------
     segment_index = 0
     current_image: Path | None = None
@@ -475,7 +677,7 @@ def main() -> None:
                     continue  # don't build a segment; audio pass will pick up current_image
 
                 print(f"  [{basename}] image, {FRAME_DURATION}s ... ", end="", flush=True)
-                build_silent_segment(f, segment_file)
+                build_silent_segment(f, segment_file, canvas)
                 print(f"{GREEN}✓{NC}")
                 total_duration += FRAME_DURATION
 
@@ -492,7 +694,7 @@ def main() -> None:
                     end="",
                     flush=True,
                 )
-                build_audio_segment(current_image, f, segment_file)
+                build_audio_segment(current_image, f, segment_file, canvas)
                 print(f"{GREEN}✓{NC}")
                 total_duration += audio_duration
 
@@ -503,6 +705,30 @@ def main() -> None:
     print(f"Generated {segment_index} segments, total duration: ~{round(total_duration)}s")
     print()
 
+    # --- Verify every segment is concat-compatible --------------------------
+    # "-c copy" writes the first segment's stream parameters into the MP4
+    # header and assumes the rest match.  A mismatch yields a file that plays
+    # under permissive decoders but goes blank in browsers, so catch it here.
+    print("Verifying segment stream parameters match...")
+    segments = sorted(segment_dir.glob("segment-*.mp4"))
+    signatures: dict[str, list[str]] = {}
+    for seg in segments:
+        signature = segment_stream_signature(seg)
+        if signature is None:
+            print(f"{RED}✗ Could not probe segment: {seg.name}{NC}")
+            sys.exit(1)
+        signatures.setdefault(signature, []).append(seg.name)
+
+    if len(signatures) > 1:
+        print(f"{RED}✗ Segments have mismatched stream parameters — the "
+              f"concatenated MP4 would not play in most browsers.{NC}")
+        for signature, names in signatures.items():
+            print(f"    {signature.splitlines()}")
+            print(f"      segments: {', '.join(names)}")
+        sys.exit(1)
+    print(f"{GREEN}✓ All {len(segments)} segments share identical stream parameters{NC}")
+    print()
+
     # --- Concatenate segments into final MP4 --------------------------------
     print("Concatenating into final MP4...")
     run_ffmpeg(
@@ -511,7 +737,10 @@ def main() -> None:
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
+            # +faststart moves the moov atom to the front so browsers can start
+            # playing before the whole file has downloaded.
             "-movflags", "+faststart",
+            "-video_track_timescale", str(MOV_TIMESCALE),
             str(mp4_file),
         ],
         capture_filter="frame=|Duration:|Output|error",

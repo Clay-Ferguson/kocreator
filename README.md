@@ -144,6 +144,44 @@ The script looks for media files in `<base-folder>/screenshots/<subfolder-name>/
 - `<subfolder-name>.mp4` — full video with audio narration
 - `<subfolder-name>.gif` — animated GIF of the screenshots (no audio)
 
+## Video Format / Browser Compatibility
+
+The MP4 is encoded for playback in every current browser on every platform,
+without a WebM fallback:
+
+| Property | Value | Why |
+|---|---|---|
+| Container | MP4, `+faststart` | `moov` atom first, so playback starts before the file finishes downloading |
+| Video codec | H.264 **High** profile, **level 4.0**, 8-bit `yuv420p` | The only codec decoded natively by every browser and OS. High profile 4:2:0 is universally supported; Baseline/Main would cost quality for no compatibility gain |
+| Resolution | One fixed canvas for the whole file, capped at 1920×1080 | **The important one** — see below |
+| Pixel aspect ratio | 1:1 (`setsar=1`) | Square pixels, so no player second-guesses the display aspect |
+| Frame rate | Constant 30 fps | A constant rate keeps `-c copy` concatenation valid; every screenshot change is already a keyframe, so seeking stays accurate |
+| Colour | BT.709 primaries/transfer/matrix, limited (`tv`) range, tagged **and** converted as such | Untagged streams are guessed at, and browsers guess differently — this keeps colours identical everywhere |
+| Audio codec | AAC-LC, 44.1 kHz, **mono**, 64 kbps | The universal web audio baseline. Mono is as universally decodable as stereo, and the narration is mono at the source (Kokoro TTS emits a single 24 kHz channel), so stereo only spent bits duplicating a channel |
+
+**Why a single fixed resolution matters.** The final MP4 is assembled by
+concatenating per-screenshot segments with `-c copy`. An MP4 records the video
+resolution once, in the container header, taken from the first segment. If a
+later segment has a different resolution, the resulting file still plays under
+permissive software decoders (ffmpeg, mpv, Chrome on Linux) but hardware
+decoders — Safari, Chrome/Edge on Windows, Firefox on most platforms — stop
+producing frames at the switch. The symptom is **audio plays but the video is
+blank**.
+
+Screenshots routinely differ in size (a branded intro splash versus app
+captures, or captures taken at different window sizes), so `create-video.py`
+picks one canvas up front — the most common screenshot size, scaled down if
+needed to stay within 1920×1080 — and scales/letterboxes every other frame onto
+it. Screenshots are never upscaled, which would blur text. When sizes differ the
+script prints a notice naming them.
+
+Before concatenating, the script probes every segment and refuses to continue
+unless they all share identical stream parameters, so a regression fails loudly
+instead of producing a file that only plays on your own machine.
+
+All of the above lives in the constants block near the top of `create-video.py`
+(`TARGET_FPS`, `MAX_WIDTH`, `MAX_HEIGHT`, `H264_PROFILE`, `H264_LEVEL`, …).
+
 ## Test Data
 
 The `test/` directory contains a built-in demo (`create-mermaid-demo`) with 9 screenshots and 9 narration scripts. Use it to verify your installation or as a reference for structuring your own content.

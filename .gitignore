@@ -1,5 +1,10 @@
 .venv/
+.venv-*/
 attic/
 __pycache__/
 *.wav
-
+# TTS cache: WAVs plus their .json manifests
+generated-wav/
+# Output captured from host test runs (e.g. ./test-generate.sh > out-test.txt)
+out-*.txt
+.claude/

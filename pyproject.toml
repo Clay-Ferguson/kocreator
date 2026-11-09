@@ -1,49 +1,16 @@
 [project]
 name = "kocreator"
 version = "0.1.0"
-description = "Build narrated demo videos (MP4 + GIF) from screenshots and text, using Kokoro TTS"
-# Python 3.12 only: kokoro and misaki both declare requires-python ">=3.10,<3.13",
-# and the pinned numpy==2.5.2 requires >=3.12. `.python-version` pins 3.12, which uv
-# fetches into its shared store if the machine doesn't have it.
-requires-python = ">=3.12,<3.13"
+description = "Build narrated demo videos (MP4 + GIF) from screenshots and text, with speech from a pluggable TTS folder"
+# `.python-version` pins 3.12, which uv fetches into its shared store if the
+# machine doesn't have it. (3.11+ is needed for tomllib.)
+requires-python = ">=3.12"
 
-# These are the project's *direct* dependencies, pinned to the versions it has been
-# verified against. Transitive packages (transformers, spacy, tokenizers, ...) are
-# left to the resolver and recorded exactly in uv.lock -- read the "Upgrading
-# Dependencies" section of README.md before touching them.
-dependencies = [
-    # Text-to-speech engine, plus the grapheme-to-phoneme frontend it uses.
-    # The [en] extra pulls the English G2P stack (espeakng-loader, num2words, spacy).
-    "kokoro==0.9.4",
-    "misaki[en]==0.9.4",
-    # WAV encoding for the generated narration audio.
-    "soundfile==0.14.0",
-    # Audio buffer concatenation. Also a kokoro dependency, but pinned here because
-    # create-video.py and kokoro-txt-to-wav.py both import it directly.
-    "numpy==2.5.2",
-    # Inference backend. create-video.py imports torch directly to cap thread counts
-    # when HIGH_PERFORMANCE is False. Comes from the CPU-only index below.
-    "torch==2.13.0",
-    # spaCy English pipeline used by misaki's G2P. It is not published to PyPI, so it
-    # is referenced by its official release URL. Declaring it here matters: without
-    # it, misaki calls spacy.cli.download() on first use, which silently breaks the
-    # "no internet after setup" guarantee on a fresh machine.
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
-]
-
-# torch comes from PyTorch's CPU-only index. The default PyPI build for Linux drags
-# in ~3.4 GB of NVIDIA CUDA runtime wheels (nvidia-*, cuda-*, triton) whether or not
-# the machine has an NVIDIA GPU, and Kokoro only ever chooses between `cuda` and
-# `cpu`. The 82M-parameter model runs comfortably on CPU. On a machine with an
-# NVIDIA GPU you want to use, delete the `torch` source below and re-run `uv lock`.
-# `explicit` keeps every other package on PyPI.
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
+# create-video.py uses only the standard library: video work is done by the
+# ffmpeg/ffprobe binaries, and speech by a TTS plugin folder (../kocreator-*),
+# which runs its engine in its own environment. Read the "Upgrading
+# Dependencies" section of README.md before adding anything here.
+dependencies = []
 
 # Not an installable package: uv only builds the virtualenv from the dependencies
 # above, and the scripts run straight out of the tree via `uv run`.

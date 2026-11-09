@@ -5,16 +5,22 @@ Create a demo video from screenshots and optional audio narration.
 Supports interleaved .png screenshots and audio in several formats:
   .mp3  — used directly as audio input
   .wav  — used directly as audio input (highest quality)
-  .txt  — converted to WAV via Kokoro TTS, then used as audio input
+  .txt  — converted to WAV by the configured TTS plugin, then used as audio input
 
 Files are ordered by filename — use numeric prefixes (001-, 002-, etc.).
 During audio clips, the most recent screenshot is held on screen.
 Each screenshot without audio is displayed for FRAME_DURATION seconds.
 
-When .txt narration files are present, the Kokoro TTS engine is used to
-generate WAV audio. Generated files are cached in a generated-wav/
-subfolder inside the screenshot directory and reused on subsequent runs
-if the .txt source hasn't changed.
+When .txt narration files are present, speech comes from a TTS plugin: a
+folder (normally a sibling such as ../kocreator-kokoro) holding a tts.sh
+script with a fixed interface — see "Writing a TTS plugin" in README.md.  The
+plugin is chosen by kocreator.toml, the KOCREATOR_TTS_PLUGIN environment
+variable, or --plugin.  Generated files are cached in a generated-wav/
+subfolder inside the screenshot directory, each with a .json manifest and a
+.log of the plugin's output beside it, and reused on subsequent runs as long
+as the narration text, the seed and the plugin's reported settings are
+unchanged.  An optional <name>.seed file next to a narration .txt picks a
+different take (seed) for that one clip, on engines that support seeds.
 
 The MP4 is encoded for maximum browser compatibility: H.264 High profile
 level 4.0 (8-bit yuv420p), one fixed resolution for the whole file, square
@@ -23,31 +29,52 @@ container. Screenshots of differing sizes are letterboxed onto a single canvas
 rather than switching resolution mid-stream — see the encoding constants below
 and the README for why that matters.
 
-Usage: python create-video.py <base-folder> <subfolder-name>
+Usage: python create-video.py <base-folder> <subfolder-name> [--plugin DIR]
 
 Example folder structure:
   <base-folder>/screenshots/my-demo/
     001-welcome.png
     002-narration.mp3          (or .wav, or .txt)
     003-next-screen.png
-    004-explanation.txt         (narration text → Kokoro TTS → WAV)
+    004-explanation.txt         (narration text → TTS plugin → WAV)
+    004-explanation.seed        (optional: re-roll this clip with another seed)
     005-final.png
 """
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import tomllib
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 FRAME_DURATION = 2  # seconds per screenshot (images without audio)
-KOKORO_VOICE = "am_liam" # NOTE: Originally we had 'bm_daniel' here.
-SAMPLE_RATE = 24000  # Kokoro TTS output sample rate
+
+# ---------------------------------------------------------------------------
+# Text-to-speech (plugin)
+# ---------------------------------------------------------------------------
+# Narration is spoken by a TTS plugin folder containing an executable tts.sh
+# (see "Writing a TTS plugin" in README.md).  Which folder is used comes from,
+# in order of precedence: the --plugin flag, the KOCREATOR_TTS_PLUGIN
+# environment variable, or tts_plugin in kocreator.toml.  A relative path is
+# resolved against this project's folder, so "../kocreator-kokoro" means the
+# sibling folder.  Voice settings live in each plugin's own tts.sh.
+KOCREATOR_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = KOCREATOR_DIR / "kocreator.toml"
+PLUGIN_ENV_VAR = "KOCREATOR_TTS_PLUGIN"
+PLUGIN_SCRIPT = "tts.sh"
+DONE_MARKER = "KOCREATOR_DONE"  # the plugin prints "KOCREATOR_DONE <n>" after each clip
 
 # ---------------------------------------------------------------------------
 # Web-compatibility encoding profile
@@ -70,7 +97,7 @@ H264_LEVEL = "4.0"       # 4.0 covers up to 1920x1080@30 on every shipping decod
 PAD_COLOR = "black"      # letterbox/pillarbox fill
 # AAC-LC at 44.1 kHz is the universal web audio baseline.  Mono is just as
 # universally decodable as stereo, and the narration is mono to begin with
-# (Kokoro TTS emits a single 24 kHz channel), so encoding stereo only spent
+# (every TTS engine we use emits a single channel), so encoding stereo only spent
 # bits on a duplicate channel.  64 kbps mono is ample for speech.
 AUDIO_RATE = 44100
 AUDIO_CHANNELS = 1
@@ -161,102 +188,324 @@ def get_audio_duration(audio_path: Path) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Kokoro TTS (in-process)
+# TTS via plugin (subprocess)
 # ---------------------------------------------------------------------------
+# A plugin is any folder holding an executable tts.sh that answers:
+#   tts.sh check               exit 0 when ready, else explain on stderr
+#   tts.sh settings            print a JSON object of audio-shaping settings
+#   tts.sh speak <jobs.tsv>    speak every job (input, output, seed per line) in one
+#                              run, printing "KOCREATOR_DONE <n>" after each one
+# Speaking is batch-only: a single clip is simply a batch of one.
+# See "Writing a TTS plugin" in README.md for the full contract.
 
-# Voice prefix -> language code mapping (mirrors kokoro-txt-to-wav.py)
-_LANG_CODE_MAP = {
-    "a": "a",  # American English
-    "b": "b",  # British English
-    "e": "e",  # Spanish
-    "f": "f",  # French
-    "h": "h",  # Hindi
-    "i": "i",  # Italian
-    "j": "j",  # Japanese
-    "p": "p",  # Portuguese
-    "z": "z",  # Mandarin Chinese
-}
-
-# Lazy-loaded pipeline — only initialised when TTS is actually needed.
-_kokoro_pipeline = None
+TtsSettings = dict[str, object]
 
 
-def _detect_lang_code(voice: str) -> str:
-    """Detect language code from voice name prefix."""
-    if voice and len(voice) >= 2:
-        first_char = voice[0]
-        if first_char in _LANG_CODE_MAP:
-            return _LANG_CODE_MAP[first_char]
-    return "a"
+def resolve_plugin_dir(cli_value: str | None) -> Path:
+    """Return the TTS plugin folder: --plugin, else $KOCREATOR_TTS_PLUGIN, else kocreator.toml."""
+    if cli_value:
+        raw, source = cli_value, "--plugin"
+    elif os.environ.get(PLUGIN_ENV_VAR):
+        raw, source = os.environ[PLUGIN_ENV_VAR], PLUGIN_ENV_VAR
+    else:
+        source = str(CONFIG_FILE)
+        try:
+            with CONFIG_FILE.open("rb") as fh:
+                raw = tomllib.load(fh).get("tts_plugin", "")
+        except FileNotFoundError:
+            raw = ""
+        except tomllib.TOMLDecodeError as exc:
+            print(f"{RED}✗ Could not parse {CONFIG_FILE}: {exc}{NC}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(raw, str) or not raw.strip():
+            print(
+                f"{RED}✗ No TTS plugin configured.{NC} Set tts_plugin in {CONFIG_FILE}, "
+                f"export {PLUGIN_ENV_VAR}, or pass --plugin DIR.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    path = Path(os.path.expanduser(raw.strip()))
+    if not path.is_absolute():
+        path = KOCREATOR_DIR / path
+    path = path.resolve()
+
+    script = path / PLUGIN_SCRIPT
+    if not script.is_file() or not os.access(script, os.X_OK):
+        print(
+            f"{RED}✗ TTS plugin not found: {script}{NC} (from {source})\n"
+            "A plugin folder must contain an executable tts.sh. Check out one of\n"
+            "kocreator-kokoro, Buffy or kocreator-qwen next to this\n"
+            "project and point kocreator.toml at it.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return path
 
 
-def _ensure_kokoro_pipeline() -> None:
-    """Lazily initialise the Kokoro TTS pipeline."""
-    global _kokoro_pipeline  # noqa: PLW0603
-    if _kokoro_pipeline is not None:
-        return
+def tts_env() -> dict[str, str]:
+    """Environment for every plugin subprocess."""
+    env = os.environ.copy()
+    # uv-env.sh exports UV_PROJECT_ENVIRONMENT pointing at *this* project's venv,
+    # and `uv run` sets VIRTUAL_ENV to it.  Inherited by a plugin's own `uv run`,
+    # UV_PROJECT_ENVIRONMENT would make uv install the plugin's dependencies into
+    # our venv, so both are dropped and each plugin uses its own environment.
+    env.pop("UV_PROJECT_ENVIRONMENT", None)
+    env.pop("VIRTUAL_ENV", None)
 
-    # Force fully offline mode — never contact HuggingFace Hub.
-    os.environ["HF_HUB_OFFLINE"] = "1"
+    # Always tell the plugin the thread budget, for engines (like torch) that
+    # need an explicit call rather than the env vars below.
+    env["KOCREATOR_THREADS"] = str(MAX_THREADS if not HIGH_PERFORMANCE else os.cpu_count() or 1)
 
     if not HIGH_PERFORMANCE:
-        # Limit CPU parallelism for PyTorch / OpenMP / MKL so the TTS inference
-        # stays within MAX_THREADS and doesn't spin up every core.
-        # These env vars must be set before the native extensions are loaded,
-        # which is why they live here rather than at module level.
+        # Cap the BLAS/OpenMP thread pools in the child so inference stays
+        # within MAX_THREADS and doesn't spin up every core.  (The os.nice()
+        # priority set in main() is inherited automatically.)
         thread_str = str(MAX_THREADS)
-        os.environ.setdefault("OMP_NUM_THREADS", thread_str)
-        os.environ.setdefault("MKL_NUM_THREADS", thread_str)
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", thread_str)
-        try:
-            import torch  # type: ignore[import-untyped]
-            torch.set_num_threads(MAX_THREADS)
-            torch.set_num_interop_threads(MAX_THREADS)
-        except Exception:
-            pass  # torch not available; Kokoro will still respect the env vars above
+        env.setdefault("OMP_NUM_THREADS", thread_str)
+        env.setdefault("MKL_NUM_THREADS", thread_str)
+        env.setdefault("OPENBLAS_NUM_THREADS", thread_str)
+    return env
 
+
+def run_plugin(plugin_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run ``tts.sh <args>`` with stdout+stderr merged into one captured string."""
+    return subprocess.run(
+        [str(plugin_dir / PLUGIN_SCRIPT), *args],
+        env=tts_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def check_plugin(plugin_dir: Path) -> None:
+    """Exit with the plugin's own explanation unless ``tts.sh check`` succeeds."""
+    result = run_plugin(plugin_dir, "check")
+    if result.returncode != 0:
+        print(f"{RED}✗ TTS plugin is not ready: {plugin_dir}{NC}", file=sys.stderr)
+        print(result.stdout.rstrip(), file=sys.stderr)
+        sys.exit(1)
+
+
+def plugin_settings(plugin_dir: Path) -> TtsSettings:
+    """The JSON object ``tts.sh settings`` prints: everything that shapes its audio."""
+    result = subprocess.run(
+        [str(plugin_dir / PLUGIN_SCRIPT), "settings"],
+        env=tts_env(),
+        capture_output=True,
+        text=True,
+    )
     try:
-        from kokoro import KPipeline  # type: ignore[import-untyped]
-    except ImportError:
+        settings = json.loads(result.stdout) if result.returncode == 0 else None
+    except ValueError:
+        settings = None
+    if not isinstance(settings, dict):
         print(
-            f"{RED}✗ kokoro package not installed in current environment{NC}",
+            f"{RED}✗ {plugin_dir / PLUGIN_SCRIPT} settings did not print a JSON object "
+            f"(exit code {result.returncode}).{NC}",
             file=sys.stderr,
         )
+        print((result.stdout + result.stderr).rstrip(), file=sys.stderr)
+        sys.exit(1)
+    return settings
+
+
+def clip_seed(input_txt: Path) -> int | None:
+    """The seed (take) for one narration: its <name>.seed sidecar, else None.
+
+    A sidecar lets one glitchy clip be re-rolled without touching the others:
+    put a different whole number in ``004-narration.seed`` next to
+    ``004-narration.txt``.  The seed is part of the cache key, so adding,
+    changing or removing the sidecar regenerates just that clip.  Without a
+    sidecar no seed is passed and the plugin uses its own default.
+    """
+    seed_file = input_txt.with_suffix(".seed")
+    if not seed_file.is_file():
+        return None
+    raw = seed_file.read_text(encoding="utf-8").strip()
+    try:
+        return int(raw)
+    except ValueError:
         print(
-            "Narration .txt files require the kokoro package.\n"
-            "Run ./setup.sh (or `uv sync`), then launch with: uv run create-video.py ...",
+            f"{RED}✗ {seed_file} must contain a whole number (the seed), "
+            f"got: {raw!r}{NC}",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    lang_code = _detect_lang_code(KOKORO_VOICE)
-    _kokoro_pipeline = KPipeline(lang_code=lang_code)
+
+def tts_manifest(text: str, seed: int | None, settings: TtsSettings) -> TtsSettings:
+    """The cache key for one narration: its text, its seed, and the plugin's settings."""
+    return {
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "seed": seed,
+        "settings": settings,
+    }
 
 
-def run_kokoro_tts(input_txt: Path, output_wav: Path) -> None:
-    """Generate a WAV file from a text file using Kokoro TTS (in-process)."""
-    import numpy as np  # imported here so numpy isn't required when no TTS is used
-    import soundfile as sf
+def is_tts_cached(wav_path: Path, manifest_data: TtsSettings) -> bool:
+    """True when *wav_path* exists and its .json manifest records exactly *manifest_data*.
 
-    _ensure_kokoro_pipeline()
+    A WAV without a manifest (one from some other tool, or from a run that was
+    interrupted) never counts as cached.
+    """
+    manifest = wav_path.with_suffix(".json")
+    if not wav_path.is_file() or not manifest.is_file():
+        return False
+    try:
+        return json.loads(manifest.read_text(encoding="utf-8")) == manifest_data
+    except (OSError, ValueError):
+        return False
 
-    text = input_txt.read_text(encoding="utf-8").strip()
-    if not text:
-        print(f"{RED}✗ Narration file is empty: {input_txt.name}{NC}", file=sys.stderr)
-        sys.exit(1)
 
-    audio_chunks: list = []
-    for _gs, _ps, audio in _kokoro_pipeline(
-        text, voice=KOKORO_VOICE, speed=1.0, split_pattern=r"\n+"
-    ):
-        audio_chunks.append(audio)
+@dataclass
+class TtsJob:
+    """One narration to speak: its text file, its final WAV, seed and cache manifest."""
 
-    if not audio_chunks:
-        print(f"{RED}✗ No audio generated for: {input_txt.name}{NC}", file=sys.stderr)
-        sys.exit(1)
+    input_txt: Path
+    output_wav: Path
+    seed: int | None
+    manifest_data: TtsSettings
 
-    full_audio = np.concatenate(audio_chunks)
-    sf.write(str(output_wav), full_audio, SAMPLE_RATE)
+    @property
+    def partial_wav(self) -> Path:
+        """Where the plugin writes; renamed to output_wav only once the clip is done."""
+        return self.output_wav.with_name(f"{self.output_wav.stem}.partial.wav")
+
+    @property
+    def label(self) -> str:
+        seed_note = f" (seed {self.seed})" if self.seed is not None else ""
+        return f"[{self.input_txt.name}]{seed_note}"
+
+
+def write_jobs_file(jobs: list[TtsJob]) -> Path:
+    """Write the batch as a TSV file (input, output, seed) and return its path.
+
+    One line per job, three tab-separated fields: the absolute narration .txt
+    path, the absolute .partial.wav path to write, and the seed (empty when
+    the clip has no .seed sidecar).  Paths are absolute because plugins run
+    their engines from their own folders.
+    """
+    lines = []
+    for job in jobs:
+        fields = [
+            str(job.input_txt.resolve()),
+            str(job.partial_wav.resolve()),
+            "" if job.seed is None else str(job.seed),
+        ]
+        if any(c in field for field in fields for c in "\t\n\r"):
+            print(
+                f"{RED}✗ Paths may not contain tabs or newlines: {job.input_txt}{NC}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        lines.append("\t".join(fields) + "\n")
+
+    fd, name = tempfile.mkstemp(prefix="kocreator-tts-", suffix=".tsv")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    return Path(name)
+
+
+def finish_job(job: TtsJob, log_text: str, started: float) -> None:
+    """Move a finished clip into place, then record its log and (last) its manifest."""
+    if not job.partial_wav.is_file():
+        fail_batch(job, log_text, f"the plugin reported it done but wrote no {job.partial_wav.name}")
+    job.partial_wav.replace(job.output_wav)
+    job.output_wav.with_suffix(".log").write_text(log_text, encoding="utf-8")
+    job.output_wav.with_suffix(".json").write_text(
+        json.dumps(job.manifest_data, indent=2) + "\n", encoding="utf-8"
+    )
+    elapsed = time.perf_counter() - started
+    duration = get_audio_duration(job.output_wav)
+    audio_note = f"audio {duration:.1f}s, " if duration is not None else ""
+    print(f"{GREEN}✓{NC} ({audio_note}took {elapsed:.1f}s)")
+
+
+def fail_batch(job: TtsJob, log_text: str, reason: str) -> NoReturn:
+    """Report a failed batch, showing the plugin's output for the clip that failed."""
+    print(f"{RED}✗{NC}")
+    print(
+        f"{RED}✗ TTS plugin failed for {job.input_txt.name}: {reason}. Its output:{NC}",
+        file=sys.stderr,
+    )
+    print(log_text.rstrip(), file=sys.stderr)
+    job.partial_wav.unlink(missing_ok=True)
+    sys.exit(1)
+
+
+def run_tts_batch(plugin_dir: Path, jobs: list[TtsJob]) -> None:
+    """Speak every job with one ``tts.sh speak <jobs.tsv>`` call.
+
+    The plugin loads its engine once, speaks the jobs in order, and after
+    writing each one prints a line ``KOCREATOR_DONE <n>`` (n = 1-based job
+    number).  Each marker finishes that clip on the spot: its .partial.wav is
+    renamed into place, the plugin output since the previous marker becomes
+    its ``<name>.log``, and its manifest is written last.  So an interrupted or
+    failed batch keeps every clip finished before the failure, and never
+    leaves behind a WAV that looks cached.
+    """
+    for job in jobs:
+        job.output_wav.with_suffix(".json").unlink(missing_ok=True)
+        job.output_wav.with_suffix(".log").unlink(missing_ok=True)
+        job.partial_wav.unlink(missing_ok=True)
+
+    jobs_file = write_jobs_file(jobs)
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(
+            [str(plugin_dir / PLUGIN_SCRIPT), "speak", str(jobs_file)],
+            env=tts_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+
+        done = 0                 # jobs finished so far
+        log_lines: list[str] = []  # plugin output for the job in progress
+        print(f"  {jobs[0].label} generating WAV ... ", end="", flush=True)
+        started = time.perf_counter()
+
+        for line in proc.stdout:
+            if not line.startswith(DONE_MARKER):
+                log_lines.append(line)
+                continue
+            parts = line.split()
+            if len(parts) != 2 or parts[1] != str(done + 1):
+                fail_batch(
+                    jobs[min(done, len(jobs) - 1)],
+                    "".join(log_lines) + line,
+                    f"expected '{DONE_MARKER} {done + 1}', got {line.strip()!r}",
+                )
+            finish_job(jobs[done], "".join(log_lines), started)
+            done += 1
+            log_lines = []
+            if done < len(jobs):
+                print(f"  {jobs[done].label} generating WAV ... ", end="", flush=True)
+                started = time.perf_counter()
+
+        returncode = proc.wait()
+        if done < len(jobs):
+            fail_batch(jobs[done], "".join(log_lines), f"exit code {returncode}")
+        if returncode != 0:
+            # Every clip was delivered, but the plugin still reported failure.
+            print(
+                f"{RED}✗ TTS plugin exited with code {returncode} after finishing "
+                f"all clips. Its trailing output:{NC}",
+                file=sys.stderr,
+            )
+            print("".join(log_lines).rstrip(), file=sys.stderr)
+            sys.exit(1)
+    finally:
+        # On any early exit (a failed clip, Ctrl-C) stop the plugin rather
+        # than leave its engine running in the background.
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        jobs_file.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -468,12 +717,22 @@ def main() -> None:
         type=int,
         default=MAX_THREADS,
         metavar="N",
-        help=f"Max CPU threads for ffmpeg and Kokoro TTS (default: {MAX_THREADS})",
+        help=f"Max CPU threads for ffmpeg and the TTS engine (default: {MAX_THREADS})",
+    )
+    parser.add_argument(
+        "--plugin",
+        metavar="DIR",
+        default=None,
+        help=(
+            "TTS plugin folder containing tts.sh (overrides $KOCREATOR_TTS_PLUGIN "
+            "and tts_plugin in kocreator.toml; relative paths are resolved "
+            "against the kocreator folder)"
+        ),
     )
     args = parser.parse_args()
 
     if not HIGH_PERFORMANCE:
-        # Apply the thread limit globally so run_ffmpeg and _ensure_kokoro_pipeline
+        # Apply the thread limit globally so run_ffmpeg and tts_env
         # both pick up the (potentially overridden) value.
         MAX_THREADS = args.threads
 
@@ -577,14 +836,20 @@ def main() -> None:
         print("Audio clips need a preceding screenshot to display.")
         sys.exit(1)
 
-    # --- Kokoro TTS: convert .txt → .wav ------------------------------------
+    # --- TTS plugin: convert .txt → .wav ------------------------------------
+    plugin_name = ""
     if tts_count > 0:
-        print(
-            f"Converting {tts_count} narration text file(s) to audio "
-            f"via Kokoro TTS (voice: {KOKORO_VOICE})..."
-        )
+        plugin_dir = resolve_plugin_dir(args.plugin)
+        plugin_name = plugin_dir.name
+        check_plugin(plugin_dir)
+        settings = plugin_settings(plugin_dir)
+        settings_note = ", ".join(f"{k}: {v}" for k, v in settings.items())
+        print(f"TTS plugin: {plugin_dir}")
+        print(f"  ({settings_note})")
+        print(f"Converting {tts_count} narration text file(s) to audio...")
 
         converted_files: list[Path] = []
+        pending: list[TtsJob] = []
         for f in media_files:
             if f.suffix == ".txt":
                 # Use the appropriate generated-wav/ cache dir for the source file
@@ -597,22 +862,27 @@ def main() -> None:
                 txt_basename = f.stem
                 wav_path = wav_cache_dir / f"{txt_basename}.wav"
 
-                if (
-                    wav_path.exists()
-                    and wav_path.stat().st_mtime > f.stat().st_mtime
-                ):
-                    print(
-                        f"  [{txt_basename}.txt] {GREEN}cached{NC} → {txt_basename}.wav"
-                    )
+                text = f.read_text(encoding="utf-8").strip()
+                if not text:
+                    print(f"{RED}✗ Narration file is empty: {f.name}{NC}", file=sys.stderr)
+                    sys.exit(1)
+                seed = clip_seed(f)
+                job = TtsJob(f, wav_path, seed, tts_manifest(text, seed, settings))
+
+                if is_tts_cached(wav_path, job.manifest_data):
+                    print(f"  {job.label} {GREEN}cached{NC} → {txt_basename}.wav")
                 else:
-                    print(f"  [{txt_basename}.txt] generating WAV ... ", end="", flush=True)
-                    run_kokoro_tts(f, wav_path)
-                    print(f"{GREEN}✓{NC}")
+                    pending.append(job)
 
                 converted_files.append(wav_path)
                 audio_count += 1
             else:
                 converted_files.append(f)
+
+        if pending:
+            print(f"Generating {len(pending)} clip(s) in one batch "
+                  "(the first one includes loading the engine)...")
+            run_tts_batch(plugin_dir, pending)
 
         media_files = converted_files
         print()
@@ -638,7 +908,7 @@ def main() -> None:
     else:
         print(f"Found {image_count} screenshot(s) and {audio_count} audio clip(s)")
     if tts_count > 0:
-        print(f"  ({tts_count} narration text file(s) converted via Kokoro TTS)")
+        print(f"  ({tts_count} narration text file(s) converted via {plugin_name})")
     print(f"Image frame duration: {FRAME_DURATION}s")
     if audio_count == 0:
         print(f"Total video length: {image_count * FRAME_DURATION}s")
@@ -812,7 +1082,7 @@ def main() -> None:
         print(f"  Audio: {audio_count} clip(s) included in MP4 (not in GIF)")
         if tts_count > 0:
             print(
-                f"  TTS:   {tts_count} narration(s) generated via Kokoro "
+                f"  TTS:   {tts_count} narration(s) generated via {plugin_name} "
                 f"(cached in generated-wav/)"
             )
     print(f"  Subfolder: {subfolder_name}")

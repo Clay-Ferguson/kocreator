@@ -1,0 +1,15 @@
+# kocreator.toml — kocreator configuration.
+
+# The TTS plugin that speaks narration .txt files: a folder holding an
+# executable tts.sh (see "Writing a TTS plugin" in README.md). A relative path
+# is resolved against this folder, so "../kocreator-kokoro" is the sibling
+# folder. The ones that exist today:
+#
+#   "../kocreator-kokoro"     Kokoro (Apache 2.0), self-contained
+#   "../Buffy"                Underdog Woof (non-commercial license), self-contained
+#   "../kocreator-qwen"       Qwen3-TTS, self-contained (slow on a CPU)
+#
+# For one run, KOCREATOR_TTS_PLUGIN=<dir> or `create-video.py --plugin <dir>`
+# overrides this.
+tts_plugin = "../kocreator-kokoro"
+# tts_plugin = "../Buffy" # <-- Underdog Woof model
